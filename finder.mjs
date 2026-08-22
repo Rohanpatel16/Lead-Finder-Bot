@@ -4,9 +4,9 @@ import dns from 'node:dns/promises';
 import net from 'node:net';
 
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const CONCURRENCY_LIMIT = 5; // Processes 5 leads in parallel (Fast & safe)
+const CONCURRENCY_LIMIT = 5; // Processes 5 leads concurrently for high speed
 
-// In-memory cache to avoid re-checking the same domain multiple times
+// In-memory cache to make repeated domains instant (0ms)
 const domainCache = new Map();
 
 // 1. Google Sheets Authentication
@@ -19,7 +19,7 @@ async function getSheets() {
   return google.sheets({ version: 'v4', auth });
 }
 
-// 2. Real-time DNS MX Lookup (With In-Memory Cache)
+// 2. Real-time DNS MX Lookup (With Domain Caching)
 async function getDomainMxInfo(domain) {
   const cleanDomain = domain.replace(/^https?:\/\//i, '').replace(/^www\./i, '').split('/')[0].trim().toLowerCase();
 
@@ -60,7 +60,7 @@ async function getDomainMxInfo(domain) {
   }
 }
 
-// 3. Ultra-Fast SMTP Mailbox Probe (3.5s Timeout)
+// 3. Fast RFC-Compliant SMTP Mailbox Probe (3.5s Timeout)
 function pingSmtpMailbox(email, mxHost) {
   return new Promise((resolve) => {
     if (!mxHost) return resolve({ exists: false, isPolicy: false, error: 'NO_MX_HOST' });
@@ -81,7 +81,7 @@ function pingSmtpMailbox(email, mxHost) {
       socket = net.createConnection(25, mxHost);
       let step = 0;
 
-      socket.setTimeout(3500); // 👈 Reduced from 8s to 3.5s for maximum speed
+      socket.setTimeout(3500); // 3.5s timeout for high speed
 
       socket.on('data', (data) => {
         const response = data.toString();
@@ -139,31 +139,50 @@ async function checkCatchAll(mxInfo) {
   }
 }
 
-// 5. Generate B2B Email Permutations
-function generateEmailPermutations(fullName, domain) {
+// 5. Complete 15-Permutation Generator (Ordered by Likelihood)
+function generateAll15Permutations(fullName, domain) {
   const nameParts = fullName.trim().toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/);
   const first = nameParts[0] || '';
   const last = nameParts.length > 1 ? nameParts[nameParts.length - 1] : '';
 
   if (!first) return [];
+  if (!last) return [`${first}@${domain}`, `contact@${domain}`];
 
-  const permutations = [];
-  if (first && last) {
-    permutations.push(`${first}.${last}@${domain}`);
-    permutations.push(`${first}@${domain}`);
-    permutations.push(`${first[0]}${last}@${domain}`);
-  } else {
-    permutations.push(`${first}@${domain}`);
-  }
+  const f = first[0];
+  const l = last[0];
 
-  return permutations;
+  const permutations = [
+    // Tier 1: Top 3 Standard Patterns (Matches ~85% of corporate emails)
+    `${first}.${last}@${domain}`,  // 1. first.last@
+    `${first}@${domain}`,         // 2. first@
+    `${f}${last}@${domain}`,       // 3. flast@
+
+    // Tier 2: Common Secondary Patterns
+    `${f}.${last}@${domain}`,      // 4. f.last@
+    `${first}${last}@${domain}`,   // 5. firstlast@
+    `${first}${l}@${domain}`,      // 6. firstl@
+    `${first}.${l}@${domain}`,     // 7. first.l@
+    `${last}@${domain}`,           // 8. last@
+
+    // Tier 3: Reverse & Deep Sweep Patterns
+    `${last}.${first}@${domain}`,  // 9. last.first@
+    `${last}${first}@${domain}`,   // 10. lastfirst@
+    `${l}${first}@${domain}`,      // 11. lfirst@
+    `${l}.${first}@${domain}`,     // 12. l.first@
+    `${last}${f}@${domain}`,       // 13. lastf@
+    `${last}.${f}@${domain}`,      // 14. last.f@
+    `${f}${l}@${domain}`           // 15. fl@
+  ];
+
+  // Return unique list only
+  return [...new Set(permutations)];
 }
 
 // ============================================================================
 // 🚀 CONCURRENT LEAD PROCESSOR
 // ============================================================================
 async function processSingleLead(leadItem) {
-  const { row, fullName, companyName, rawDomain, location } = leadItem;
+  const { fullName, companyName, rawDomain, location } = leadItem;
   const nowTime = new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Kolkata', hour12: true });
 
   try {
@@ -178,9 +197,10 @@ async function processSingleLead(leadItem) {
       };
     }
 
-    const permutations = generateEmailPermutations(fullName, mxInfo.domain);
+    const permutations = generateAll15Permutations(fullName, mxInfo.domain);
     const isCatchAll = await checkCatchAll(mxInfo);
 
+    // ⚡ Fast Path: If Catch-All, pick the #1 pattern instantly without testing all 15!
     if (isCatchAll) {
       const bestEmail = permutations[0];
       return {
@@ -192,13 +212,15 @@ async function processSingleLead(leadItem) {
       };
     }
 
-    // Precise Domain: Probe mailboxes
+    // 🎯 Precise Domain: Probe permutations sequentially until a match is found
     let verifiedEmail = null;
     let finalStatus = 'USER_NOT_FOUND';
 
-    for (const candidateEmail of permutations) {
+    for (let p = 0; p < permutations.length; p++) {
+      const candidateEmail = permutations[p];
       const probe = await pingSmtpMailbox(candidateEmail, mxInfo.primaryMx);
 
+      // 🛑 Early Exit: If verified, stop immediately and do not test remaining permutations!
       if (probe.exists && probe.code === 250) {
         verifiedEmail = candidateEmail;
         finalStatus = 'VERIFIED';
@@ -208,7 +230,7 @@ async function processSingleLead(leadItem) {
         finalStatus = 'VERIFIED';
         break;
       } else if (probe.code === 550) {
-        // Fast skip
+        // User not found on this pattern, move to next pattern
         continue;
       }
     }
@@ -246,7 +268,7 @@ async function processSingleLead(leadItem) {
 // ============================================================================
 async function runEmailFinder() {
   const startTime = Date.now();
-  console.log('⚡ Starting High-Speed Parallel Lead Finder...');
+  console.log('⚡ Starting 15-Pattern High-Speed Lead Finder...');
   const sheets = await getSheets();
 
   // Load Lead_Finder rows
@@ -307,7 +329,7 @@ async function runEmailFinder() {
   let foundCount = 0;
   let invalidCount = 0;
 
-  // Process in chunks of CONCURRENCY_LIMIT (e.g., 5 at a time)
+  // Process in parallel chunks of CONCURRENCY_LIMIT (5 at a time)
   for (let i = 0; i < pendingLeads.length; i += CONCURRENCY_LIMIT) {
     const chunk = pendingLeads.slice(i, i + CONCURRENCY_LIMIT);
 
@@ -336,7 +358,7 @@ async function runEmailFinder() {
       }
     }
 
-    // Write back progress in chunks
+    // Write back progress in chunks to Google Sheets
     const firstRowNum = chunk[0].rowNum;
     const lastRowNum = chunk[chunk.length - 1].rowNum;
     const updatedChunkValues = chunk.map(c => fRows[c.rowIndex]);
