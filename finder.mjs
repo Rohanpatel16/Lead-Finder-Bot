@@ -4,7 +4,7 @@ import dns from 'node:dns/promises';
 import net from 'node:net';
 
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const CONCURRENCY_LIMIT = 10; // Processes 5 leads concurrently
+const CONCURRENCY_LIMIT = 10;
 
 // In-memory cache to make repeated domains instant (0ms)
 const domainCache = new Map();
@@ -30,7 +30,7 @@ async function getDomainMxInfo(domain) {
   try {
     const mxRecords = await dns.resolveMx(cleanDomain);
     if (!mxRecords || mxRecords.length === 0) {
-      const res = { valid: false, domain: cleanDomain, provider: 'No MX' };
+      const res = { valid: false, domain: cleanDomain, provider: 'No MX', isDead: true };
       domainCache.set(cleanDomain, res);
       return res;
     }
@@ -45,25 +45,25 @@ async function getDomainMxInfo(domain) {
 
     const primaryMx = mxRecords[0]?.exchange || null;
     if (!primaryMx) {
-      const res = { valid: false, domain: cleanDomain, provider: 'No MX Host' };
+      const res = { valid: false, domain: cleanDomain, provider: 'No MX Host', isDead: true };
       domainCache.set(cleanDomain, res);
       return res;
     }
 
-    const res = { valid: true, domain: cleanDomain, provider, primaryMx, isCatchAll: null };
+    const res = { valid: true, domain: cleanDomain, provider, primaryMx, isCatchAll: null, isDead: false };
     domainCache.set(cleanDomain, res);
     return res;
   } catch (e) {
-    const res = { valid: false, domain: cleanDomain, provider: 'Dead Domain' };
+    const res = { valid: false, domain: cleanDomain, provider: 'Dead Domain', isDead: true };
     domainCache.set(cleanDomain, res);
     return res;
   }
 }
 
-// 3. Fast RFC-Compliant SMTP Mailbox Probe (3.5s Timeout)
-function pingSmtpMailbox(email, mxHost) {
+// 3. Fast RFC-Compliant SMTP Mailbox Probe
+function pingSmtpMailbox(email, mxHost, timeoutMs = 2500) {
   return new Promise((resolve) => {
-    if (!mxHost) return resolve({ exists: false, isPolicy: false, error: 'NO_MX_HOST', message: 'No MX host found' });
+    if (!mxHost) return resolve({ exists: false, isPolicy: false, error: 'NO_MX_HOST', message: 'No MX host' });
 
     let isResolved = false;
     let socket;
@@ -81,7 +81,7 @@ function pingSmtpMailbox(email, mxHost) {
       socket = net.createConnection(25, mxHost);
       let step = 0;
 
-      socket.setTimeout(3500);
+      socket.setTimeout(timeoutMs);
 
       socket.on('data', (data) => {
         const response = data.toString();
@@ -114,28 +114,39 @@ function pingSmtpMailbox(email, mxHost) {
       });
 
       socket.on('error', (err) => safeResolve({ exists: false, isPolicy: false, code: null, error: err.code || 'SOCKET_ERROR', message: err.message }));
-      socket.on('timeout', () => safeResolve({ exists: false, isPolicy: false, code: 408, error: 'TIMEOUT', message: 'Connection timed out (3.5s)' }));
-      socket.on('close', () => safeResolve({ exists: false, isPolicy: false, code: null, error: 'SOCKET_CLOSED', message: 'Socket connection closed abruptly' }));
+      socket.on('timeout', () => safeResolve({ exists: false, isPolicy: false, code: 408, error: 'TIMEOUT', message: 'Connection timed out' }));
+      socket.on('close', () => safeResolve({ exists: false, isPolicy: false, code: null, error: 'SOCKET_CLOSED', message: 'Socket connection closed' }));
     } catch (err) {
       safeResolve({ exists: false, isPolicy: false, code: 500, error: err.message, message: err.message });
     }
   });
 }
 
-// 4. Cached Catch-All Domain Detection
-async function checkCatchAll(mxInfo) {
-  if (mxInfo.isCatchAll !== null) return mxInfo.isCatchAll;
+// 4. Fast-Fail Pre-Flight & Catch-All Detection
+async function checkDomainHealth(mxInfo) {
+  if (mxInfo.isDead) return { isReachable: false, isCatchAll: false };
+  if (mxInfo.isCatchAll !== null) return { isReachable: true, isCatchAll: mxInfo.isCatchAll };
 
   try {
+    // ⚡ Fast 1.5s probe to check if server is alive
     const fakeEmail = `chk_${Math.random().toString(36).substring(7)}@${mxInfo.domain}`;
-    const probe = await pingSmtpMailbox(fakeEmail, mxInfo.primaryMx);
+    const probe = await pingSmtpMailbox(fakeEmail, mxInfo.primaryMx, 2000);
+
+    // If server times out on the test address, the entire domain is firewalled/dead
+    if (probe.error === 'TIMEOUT') {
+      mxInfo.isDead = true;
+      mxInfo.isCatchAll = false;
+      domainCache.set(mxInfo.domain, mxInfo);
+      return { isReachable: false, isCatchAll: false };
+    }
+
     const isCatchAll = (probe.exists === true && probe.code === 250);
     mxInfo.isCatchAll = isCatchAll;
     domainCache.set(mxInfo.domain, mxInfo);
-    return isCatchAll;
+    return { isReachable: true, isCatchAll };
   } catch (e) {
-    mxInfo.isCatchAll = false;
-    return false;
+    mxInfo.isDead = true;
+    return { isReachable: false, isCatchAll: false };
   }
 }
 
@@ -152,40 +163,37 @@ function generateAll15Permutations(fullName, domain) {
   const l = last[0];
 
   const permutations = [
-    `${first}.${last}@${domain}`,  // 1. first.last@
-    `${first}@${domain}`,         // 2. first@
-    `${f}${last}@${domain}`,       // 3. flast@
-    `${f}.${last}@${domain}`,      // 4. f.last@
-    `${first}${last}@${domain}`,   // 5. firstlast@
-    `${first}${l}@${domain}`,      // 6. firstl@
-    `${first}.${l}@${domain}`,     // 7. first.l@
-    `${last}@${domain}`,           // 8. last@
-    `${last}.${first}@${domain}`,  // 9. last.first@
-    `${last}${first}@${domain}`,   // 10. lastfirst@
-    `${l}${first}@${domain}`,      // 11. lfirst@
-    `${l}.${first}@${domain}`,     // 12. l.first@
-    `${last}${f}@${domain}`,       // 13. lastf@
-    `${last}.${f}@${domain}`,      // 14. last.f@
-    `${f}${l}@${domain}`           // 15. fl@
+    `${first}.${last}@${domain}`,
+    `${first}@${domain}`,
+    `${f}${last}@${domain}`,
+    `${f}.${last}@${domain}`,
+    `${first}${last}@${domain}`,
+    `${first}${l}@${domain}`,
+    `${first}.${l}@${domain}`,
+    `${last}@${domain}`,
+    `${last}.${first}@${domain}`,
+    `${last}${first}@${domain}`,
+    `${l}${first}@${domain}`,
+    `${l}.${first}@${domain}`,
+    `${last}${f}@${domain}`,
+    `${last}.${f}@${domain}`,
+    `${f}${l}@${domain}`
   ];
 
   return [...new Set(permutations)];
 }
 
 // ============================================================================
-// 🚀 CONCURRENT LEAD PROCESSOR (WITH VERBOSE DEBUG LOGGING)
+// 🚀 CONCURRENT LEAD PROCESSOR (WITH DOMAIN FAST-FAIL)
 // ============================================================================
 async function processSingleLead(leadItem) {
   const { fullName, companyName, rawDomain, location } = leadItem;
   const nowTime = new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Kolkata', hour12: true });
 
-  console.log(`\n======================================================`);
-  console.log(`🔎 [TESTING LEAD]: "${fullName}" at "${rawDomain}"`);
-
   try {
     const mxInfo = await getDomainMxInfo(rawDomain);
     if (!mxInfo.valid) {
-      console.log(`❌ [DOMAIN ERROR]: Domain is invalid or has no MX records (${mxInfo.provider})`);
+      console.log(`❌ [DEAD DOMAIN]: "${rawDomain}" (${mxInfo.provider})`);
       return {
         status: 'INVALID DOMAIN',
         foundEmail: '',
@@ -195,14 +203,25 @@ async function processSingleLead(leadItem) {
       };
     }
 
-    console.log(`🌐 [MX HOST]: ${mxInfo.primaryMx} (${mxInfo.provider})`);
-
     const permutations = generateAll15Permutations(fullName, mxInfo.domain);
-    const isCatchAll = await checkCatchAll(mxInfo);
+    
+    // ⚡ Fast-Fail Check: Test if domain is reachable in 1.5s
+    const { isReachable, isCatchAll } = await checkDomainHealth(mxInfo);
+
+    if (!isReachable) {
+      console.log(`⚡ [FAST-FAIL]: Server for "${mxInfo.domain}" is firewalled / timed out. Skipped in 1.5s.`);
+      return {
+        status: 'USER_NOT_FOUND',
+        foundEmail: permutations[0] || '',
+        provider: `${mxInfo.provider} (Unreachable)`,
+        nowTime,
+        leadForDetails: null,
+      };
+    }
 
     if (isCatchAll) {
       const bestEmail = permutations[0];
-      console.log(`⚠️ [CATCH-ALL]: Server accepts all emails. Auto-assigned standard pattern -> ${bestEmail}`);
+      console.log(`⚠️ [CATCH-ALL]: "${mxInfo.domain}" -> Auto-assigned pattern: ${bestEmail}`);
       return {
         status: 'CATCH_ALL',
         foundEmail: bestEmail,
@@ -212,37 +231,35 @@ async function processSingleLead(leadItem) {
       };
     }
 
-    console.log(`🎯 [PRECISE SERVER]: Testing ${permutations.length} permutations...`);
-
+    // Precise Server: Probe permutations
     let verifiedEmail = null;
     let finalStatus = 'USER_NOT_FOUND';
 
     for (let p = 0; p < permutations.length; p++) {
       const candidateEmail = permutations[p];
-      const probe = await pingSmtpMailbox(candidateEmail, mxInfo.primaryMx);
-
-      const codeStr = probe.code ? `[CODE ${probe.code}]` : `[${probe.error}]`;
-      const msgStr = probe.message ? `-> "${probe.message}"` : '';
+      const probe = await pingSmtpMailbox(candidateEmail, mxInfo.primaryMx, 2500);
 
       if (probe.exists && probe.code === 250) {
-        console.log(`  ✅ Pattern #${p + 1} (${candidateEmail}) ${codeStr} ${msgStr}`);
+        console.log(`  ✅ Pattern #${p + 1} (${candidateEmail}) [250 OK] -> "${fullName}"`);
         verifiedEmail = candidateEmail;
         finalStatus = 'VERIFIED';
         break;
       } else if (probe.isPolicy) {
-        console.log(`  🛡️ Pattern #${p + 1} (${candidateEmail}) ${codeStr} Policy Accepted ${msgStr}`);
+        console.log(`  🛡️ Pattern #${p + 1} (${candidateEmail}) [POLICY ACCEPTED] -> "${fullName}"`);
         verifiedEmail = candidateEmail;
         finalStatus = 'VERIFIED';
         break;
       } else if (probe.code === 550) {
-        console.log(`  ❌ Pattern #${p + 1} (${candidateEmail}) ${codeStr} User Not Found`);
-      } else {
-        console.log(`  ⚠️ Pattern #${p + 1} (${candidateEmail}) ${codeStr} ${msgStr}`);
+        // Fast skip
+        continue;
+      } else if (probe.error === 'TIMEOUT') {
+        // If candidate times out, break early for this person
+        break;
       }
     }
 
     if (verifiedEmail) {
-      console.log(`🎉 [SUCCESS]: Verified email for ${fullName} -> ${verifiedEmail}`);
+      console.log(`🎉 [SUCCESS]: ${fullName} -> ${verifiedEmail}`);
       return {
         status: finalStatus,
         foundEmail: verifiedEmail,
@@ -251,7 +268,7 @@ async function processSingleLead(leadItem) {
         leadForDetails: [fullName, verifiedEmail, companyName, location, '', '', '', '', '', '', 0, ''],
       };
     } else {
-      console.log(`🚫 [FAILED]: All ${permutations.length} patterns rejected by server for ${fullName}`);
+      console.log(`🚫 [FAILED]: No mailbox match for ${fullName} at ${rawDomain}`);
       return {
         status: 'USER_NOT_FOUND',
         foundEmail: permutations[0] || '',
@@ -261,7 +278,7 @@ async function processSingleLead(leadItem) {
       };
     }
   } catch (err) {
-    console.error(`💥 [CRASH ERROR on ${fullName}]:`, err.message);
+    console.error(`💥 [ERROR on ${fullName}]:`, err.message);
     return {
       status: 'ERROR',
       foundEmail: '',
@@ -277,7 +294,7 @@ async function processSingleLead(leadItem) {
 // ============================================================================
 async function runEmailFinder() {
   const startTime = Date.now();
-  console.log('⚡ Starting High-Speed 15-Pattern Lead Finder (With Full Debug Tracing)...');
+  console.log('⚡ Starting High-Speed 15-Pattern Lead Finder (With Fast-Fail Technology)...');
   const sheets = await getSheets();
 
   // Load Lead_Finder rows
