@@ -4,7 +4,7 @@ import dns from 'node:dns/promises';
 import net from 'node:net';
 
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const CONCURRENCY_LIMIT = 5; // Processes 5 leads concurrently for high speed
+const CONCURRENCY_LIMIT = 5; // Processes 5 leads concurrently
 
 // In-memory cache to make repeated domains instant (0ms)
 const domainCache = new Map();
@@ -63,7 +63,7 @@ async function getDomainMxInfo(domain) {
 // 3. Fast RFC-Compliant SMTP Mailbox Probe (3.5s Timeout)
 function pingSmtpMailbox(email, mxHost) {
   return new Promise((resolve) => {
-    if (!mxHost) return resolve({ exists: false, isPolicy: false, error: 'NO_MX_HOST' });
+    if (!mxHost) return resolve({ exists: false, isPolicy: false, error: 'NO_MX_HOST', message: 'No MX host found' });
 
     let isResolved = false;
     let socket;
@@ -81,7 +81,7 @@ function pingSmtpMailbox(email, mxHost) {
       socket = net.createConnection(25, mxHost);
       let step = 0;
 
-      socket.setTimeout(3500); // 3.5s timeout for high speed
+      socket.setTimeout(3500);
 
       socket.on('data', (data) => {
         const response = data.toString();
@@ -113,11 +113,11 @@ function pingSmtpMailbox(email, mxHost) {
         }
       });
 
-      socket.on('error', (err) => safeResolve({ exists: false, isPolicy: false, error: err.code || 'SOCKET_ERROR' }));
-      socket.on('timeout', () => safeResolve({ exists: false, isPolicy: false, error: 'TIMEOUT' }));
-      socket.on('close', () => safeResolve({ exists: false, isPolicy: false, error: 'SOCKET_CLOSED' }));
+      socket.on('error', (err) => safeResolve({ exists: false, isPolicy: false, code: null, error: err.code || 'SOCKET_ERROR', message: err.message }));
+      socket.on('timeout', () => safeResolve({ exists: false, isPolicy: false, code: 408, error: 'TIMEOUT', message: 'Connection timed out (3.5s)' }));
+      socket.on('close', () => safeResolve({ exists: false, isPolicy: false, code: null, error: 'SOCKET_CLOSED', message: 'Socket connection closed abruptly' }));
     } catch (err) {
-      safeResolve({ exists: false, isPolicy: false, error: err.message });
+      safeResolve({ exists: false, isPolicy: false, code: 500, error: err.message, message: err.message });
     }
   });
 }
@@ -139,7 +139,7 @@ async function checkCatchAll(mxInfo) {
   }
 }
 
-// 5. Complete 15-Permutation Generator (Ordered by Likelihood)
+// 5. Complete 15-Permutation Generator
 function generateAll15Permutations(fullName, domain) {
   const nameParts = fullName.trim().toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/);
   const first = nameParts[0] || '';
@@ -152,19 +152,14 @@ function generateAll15Permutations(fullName, domain) {
   const l = last[0];
 
   const permutations = [
-    // Tier 1: Top 3 Standard Patterns (Matches ~85% of corporate emails)
     `${first}.${last}@${domain}`,  // 1. first.last@
     `${first}@${domain}`,         // 2. first@
     `${f}${last}@${domain}`,       // 3. flast@
-
-    // Tier 2: Common Secondary Patterns
     `${f}.${last}@${domain}`,      // 4. f.last@
     `${first}${last}@${domain}`,   // 5. firstlast@
     `${first}${l}@${domain}`,      // 6. firstl@
     `${first}.${l}@${domain}`,     // 7. first.l@
     `${last}@${domain}`,           // 8. last@
-
-    // Tier 3: Reverse & Deep Sweep Patterns
     `${last}.${first}@${domain}`,  // 9. last.first@
     `${last}${first}@${domain}`,   // 10. lastfirst@
     `${l}${first}@${domain}`,      // 11. lfirst@
@@ -174,20 +169,23 @@ function generateAll15Permutations(fullName, domain) {
     `${f}${l}@${domain}`           // 15. fl@
   ];
 
-  // Return unique list only
   return [...new Set(permutations)];
 }
 
 // ============================================================================
-// 🚀 CONCURRENT LEAD PROCESSOR
+// 🚀 CONCURRENT LEAD PROCESSOR (WITH VERBOSE DEBUG LOGGING)
 // ============================================================================
 async function processSingleLead(leadItem) {
   const { fullName, companyName, rawDomain, location } = leadItem;
   const nowTime = new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Kolkata', hour12: true });
 
+  console.log(`\n======================================================`);
+  console.log(`🔎 [TESTING LEAD]: "${fullName}" at "${rawDomain}"`);
+
   try {
     const mxInfo = await getDomainMxInfo(rawDomain);
     if (!mxInfo.valid) {
+      console.log(`❌ [DOMAIN ERROR]: Domain is invalid or has no MX records (${mxInfo.provider})`);
       return {
         status: 'INVALID DOMAIN',
         foundEmail: '',
@@ -197,12 +195,14 @@ async function processSingleLead(leadItem) {
       };
     }
 
+    console.log(`🌐 [MX HOST]: ${mxInfo.primaryMx} (${mxInfo.provider})`);
+
     const permutations = generateAll15Permutations(fullName, mxInfo.domain);
     const isCatchAll = await checkCatchAll(mxInfo);
 
-    // ⚡ Fast Path: If Catch-All, pick the #1 pattern instantly without testing all 15!
     if (isCatchAll) {
       const bestEmail = permutations[0];
+      console.log(`⚠️ [CATCH-ALL]: Server accepts all emails. Auto-assigned standard pattern -> ${bestEmail}`);
       return {
         status: 'CATCH_ALL',
         foundEmail: bestEmail,
@@ -212,7 +212,8 @@ async function processSingleLead(leadItem) {
       };
     }
 
-    // 🎯 Precise Domain: Probe permutations sequentially until a match is found
+    console.log(`🎯 [PRECISE SERVER]: Testing ${permutations.length} permutations...`);
+
     let verifiedEmail = null;
     let finalStatus = 'USER_NOT_FOUND';
 
@@ -220,22 +221,28 @@ async function processSingleLead(leadItem) {
       const candidateEmail = permutations[p];
       const probe = await pingSmtpMailbox(candidateEmail, mxInfo.primaryMx);
 
-      // 🛑 Early Exit: If verified, stop immediately and do not test remaining permutations!
+      const codeStr = probe.code ? `[CODE ${probe.code}]` : `[${probe.error}]`;
+      const msgStr = probe.message ? `-> "${probe.message}"` : '';
+
       if (probe.exists && probe.code === 250) {
+        console.log(`  ✅ Pattern #${p + 1} (${candidateEmail}) ${codeStr} ${msgStr}`);
         verifiedEmail = candidateEmail;
         finalStatus = 'VERIFIED';
         break;
       } else if (probe.isPolicy) {
+        console.log(`  🛡️ Pattern #${p + 1} (${candidateEmail}) ${codeStr} Policy Accepted ${msgStr}`);
         verifiedEmail = candidateEmail;
         finalStatus = 'VERIFIED';
         break;
       } else if (probe.code === 550) {
-        // User not found on this pattern, move to next pattern
-        continue;
+        console.log(`  ❌ Pattern #${p + 1} (${candidateEmail}) ${codeStr} User Not Found`);
+      } else {
+        console.log(`  ⚠️ Pattern #${p + 1} (${candidateEmail}) ${codeStr} ${msgStr}`);
       }
     }
 
     if (verifiedEmail) {
+      console.log(`🎉 [SUCCESS]: Verified email for ${fullName} -> ${verifiedEmail}`);
       return {
         status: finalStatus,
         foundEmail: verifiedEmail,
@@ -244,6 +251,7 @@ async function processSingleLead(leadItem) {
         leadForDetails: [fullName, verifiedEmail, companyName, location, '', '', '', '', '', '', 0, ''],
       };
     } else {
+      console.log(`🚫 [FAILED]: All ${permutations.length} patterns rejected by server for ${fullName}`);
       return {
         status: 'USER_NOT_FOUND',
         foundEmail: permutations[0] || '',
@@ -253,6 +261,7 @@ async function processSingleLead(leadItem) {
       };
     }
   } catch (err) {
+    console.error(`💥 [CRASH ERROR on ${fullName}]:`, err.message);
     return {
       status: 'ERROR',
       foundEmail: '',
@@ -268,7 +277,7 @@ async function processSingleLead(leadItem) {
 // ============================================================================
 async function runEmailFinder() {
   const startTime = Date.now();
-  console.log('⚡ Starting 15-Pattern High-Speed Lead Finder...');
+  console.log('⚡ Starting High-Speed 15-Pattern Lead Finder (With Full Debug Tracing)...');
   const sheets = await getSheets();
 
   // Load Lead_Finder rows
@@ -283,7 +292,7 @@ async function runEmailFinder() {
   }
   const fCol = Object.fromEntries(fHeaders.map((h, i) => [h.trim(), i]));
 
-  // Load Details rows to prevent duplicates
+  // Load Details rows
   const detailsRes = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: "'Details'!A:Z",
@@ -291,7 +300,6 @@ async function runEmailFinder() {
   const [dHeaders, ...dRows] = detailsRes.data.values || [];
   const existingEmails = new Set(dRows.map(r => (r[1] || '').trim().toLowerCase()));
 
-  // Filter queue of pending rows
   const pendingLeads = [];
   for (let i = 0; i < fRows.length; i++) {
     const row = fRows[i];
@@ -323,23 +331,20 @@ async function runEmailFinder() {
     });
   }
 
-  console.log(`📋 Found ${pendingLeads.length} leads to process in parallel (Concurrency: ${CONCURRENCY_LIMIT})...\n`);
+  console.log(`📋 Processing ${pendingLeads.length} leads (Parallel Concurrency: ${CONCURRENCY_LIMIT})...\n`);
 
   const newDetailsRows = [];
   let foundCount = 0;
   let invalidCount = 0;
 
-  // Process in parallel chunks of CONCURRENCY_LIMIT (5 at a time)
   for (let i = 0; i < pendingLeads.length; i += CONCURRENCY_LIMIT) {
     const chunk = pendingLeads.slice(i, i + CONCURRENCY_LIMIT);
-
     const results = await Promise.all(chunk.map(lead => processSingleLead(lead)));
 
     for (let j = 0; j < chunk.length; j++) {
       const lead = chunk[j];
       const res = results[j];
 
-      // Update in-memory row
       fRows[lead.rowIndex][fCol['Status']] = res.status;
       fRows[lead.rowIndex][fCol['Found Email']] = res.foundEmail;
       fRows[lead.rowIndex][fCol['Mail Provider']] = res.provider;
@@ -351,14 +356,12 @@ async function runEmailFinder() {
           existingEmails.add(res.foundEmail.toLowerCase());
           newDetailsRows.push(res.leadForDetails);
         }
-        console.log(`✅ [${res.status}] ${lead.fullName} -> ${res.foundEmail}`);
       } else {
         invalidCount++;
-        console.log(`❌ [${res.status}] ${lead.fullName} (${lead.rawDomain})`);
       }
     }
 
-    // Write back progress in chunks to Google Sheets
+    // Write chunk updates to sheet
     const firstRowNum = chunk[0].rowNum;
     const lastRowNum = chunk[chunk.length - 1].rowNum;
     const updatedChunkValues = chunk.map(c => fRows[c.rowIndex]);
@@ -371,7 +374,6 @@ async function runEmailFinder() {
     });
   }
 
-  // Batch insert verified leads to Details tab
   if (newDetailsRows.length > 0) {
     await sheets.spreadsheets.values.append({
       spreadsheetId: SPREADSHEET_ID,
@@ -379,11 +381,11 @@ async function runEmailFinder() {
       valueInputOption: 'USER_ENTERED',
       requestBody: { values: newDetailsRows },
     });
-    console.log(`\n🚀 Transferred ${newDetailsRows.length} verified leads to "Details" tab.`);
+    console.log(`\n🚀 Appended ${newDetailsRows.length} verified leads to "Details" tab.`);
   }
 
   const durationSec = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`\n🏁 Finished in ${durationSec}s! Total Verified/Catch-All: ${foundCount}, Rejected/Invalid: ${invalidCount}`);
+  console.log(`\n🏁 Completed in ${durationSec}s! Total Verified/Catch-All: ${foundCount}, Rejected/Invalid: ${invalidCount}`);
 }
 
 runEmailFinder().catch(console.error);
