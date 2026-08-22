@@ -4,7 +4,7 @@ import dns from 'node:dns/promises';
 import net from 'node:net';
 
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const CONCURRENCY_LIMIT = 5;
+const CONCURRENCY_LIMIT = 10;
 
 // In-memory domain cache
 const domainCache = new Map();
