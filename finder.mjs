@@ -4,7 +4,7 @@ import dns from 'node:dns/promises';
 import net from 'node:net';
 
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const CONCURRENCY_LIMIT = 5; // Processes 5 leads concurrently
+const CONCURRENCY_LIMIT = 10; // Processes 5 leads concurrently
 
 // In-memory cache to make repeated domains instant (0ms)
 const domainCache = new Map();
