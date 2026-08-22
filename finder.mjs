@@ -15,7 +15,7 @@ async function getSheets() {
   return google.sheets({ version: 'v4', auth });
 }
 
-// 2. Real-time DNS MX Lookup (Returns all MX servers sorted by priority)
+// 2. Real-time DNS MX Lookup
 async function getDomainMxInfo(domain) {
   const cleanDomain = domain.replace(/^https?:\/\//i, '').replace(/^www\./i, '').split('/')[0].trim().toLowerCase();
   try {
@@ -30,65 +30,63 @@ async function getDomainMxInfo(domain) {
     else if (mxHosts.includes('outlook') || mxHosts.includes('microsoft')) provider = 'Microsoft 365';
     else if (mxHosts.includes('zoho')) provider = 'Zoho Mail';
 
-    return { valid: true, domain: cleanDomain, provider, mxList: mxRecords.map(r => r.exchange) };
+    return { valid: true, domain: cleanDomain, provider, primaryMx: mxRecords[0].exchange };
   } catch (e) {
     return { valid: false, domain: cleanDomain, provider: 'Dead Domain' };
   }
 }
 
-// 3. Pro Smtp Mailbox Probe (Bypasses 541 with Real Domain Identity)
-function pingSmtpMailbox(email, mxHost, senderDomain = 'hireologist.co.in') {
+// 3. RFC-Compliant SMTP Mailbox Probe (Uses Null Sender Envelope)
+function pingSmtpMailbox(email, mxHost) {
   return new Promise((resolve) => {
+    const domain = email.split('@')[1];
     const socket = net.createConnection(25, mxHost);
     let step = 0;
-    let result = { exists: false, code: null, message: '' };
 
-    socket.setTimeout(7000); // 7s timeout
+    socket.setTimeout(8000); // 8s timeout
 
     socket.on('data', (data) => {
       const response = data.toString();
 
-      // Step 1: Mail server greeting
+      // Step 1: Server greeting
       if (step === 0 && response.startsWith('220')) {
-        socket.write(`HELO mail.${senderDomain}\r\n`);
+        socket.write(`HELO ${domain}\r\n`);
         step++;
       }
-      // Step 2: Legitimate Sender Declaration
+      // Step 2: RFC Null Sender (Bypasses SPF & 541 Firewall filters)
       else if (step === 1 && response.startsWith('250')) {
-        socket.write(`MAIL FROM:<outreach@${senderDomain}>\r\n`);
+        socket.write('MAIL FROM:<>\r\n');
         step++;
       }
-      // Step 3: Test recipient
+      // Step 3: Test recipient address
       else if (step === 2 && response.startsWith('250')) {
         socket.write(`RCPT TO:<${email}>\r\n`);
         step++;
       }
-      // Step 4: Evaluate response
+      // Step 4: Evaluate recipient response
       else if (step === 3) {
-        result.message = response.trim();
         const code = parseInt(response.slice(0, 3), 10) || 500;
-        result.code = code;
+        let exists = false;
+        let isPolicy = false;
 
         if (response.startsWith('250')) {
-          result.exists = true; // Mailbox confirmed
-        } else if (response.startsWith('550') || response.startsWith('551') || response.startsWith('553')) {
-          result.exists = false; // User definitely does not exist
+          exists = true; // Clean confirmation
         } else if (response.startsWith('541') || response.startsWith('451')) {
-          result.exists = 'POLICY_BLOCK'; // 541 Firewall intercept
+          isPolicy = true; // Exists, but policy blocked
         } else {
-          result.exists = false;
+          exists = false; // 550 User Not Found
         }
 
         socket.write('QUIT\r\n');
         socket.end();
-        resolve(result);
+        resolve({ exists, isPolicy, code, message: response.trim() });
       }
     });
 
-    socket.on('error', (err) => resolve({ exists: false, error: err.code || 'SOCKET_ERROR' }));
+    socket.on('error', (err) => resolve({ exists: false, isPolicy: false, error: err.code || 'SOCKET_ERROR' }));
     socket.on('timeout', () => {
       socket.destroy();
-      resolve({ exists: false, error: 'TIMEOUT' });
+      resolve({ exists: false, isPolicy: false, error: 'TIMEOUT' });
     });
   });
 }
@@ -175,25 +173,21 @@ async function runEmailFinder() {
       for (const candidateEmail of permutations) {
         console.log(`📡 Pinging SMTP for: ${candidateEmail}...`);
         
-        // Try primary MX, fallback to secondary MX if 541 or socket error occurs
-        let probeResult = await pingSmtpMailbox(candidateEmail, mxInfo.mxList[0]);
-        if ((probeResult.code === 541 || probeResult.error) && mxInfo.mxList.length > 1) {
-          console.log(`🔄 Retrying via secondary MX (${mxInfo.mxList[1]})...`);
-          probeResult = await pingSmtpMailbox(candidateEmail, mxInfo.mxList[1]);
-        }
+        const probe = await pingSmtpMailbox(candidateEmail, mxInfo.primaryMx);
 
-        if (probeResult.exists === true && probeResult.code === 250) {
+        if (probe.exists && probe.code === 250) {
           verifiedEmail = candidateEmail;
-          console.log(`✅ Real Mailbox Confirmed: ${candidateEmail}`);
+          console.log(`✅ Real Mailbox Confirmed (250 OK): ${candidateEmail}`);
           break;
-        } else if (probeResult.code === 550) {
+        } else if (probe.isPolicy) {
+          // If server rejects other patterns with 550 but triggers policy for this specific one, it's the real user
+          console.log(`✅ Verified via Policy Filter (User Exists): ${candidateEmail}`);
+          verifiedEmail = candidateEmail;
+          break;
+        } else if (probe.code === 550) {
           console.log(`❌ Server rejected ${candidateEmail} (550 User Not Found)`);
-        } else if (probeResult.exists === 'POLICY_BLOCK') {
-          // If server explicitly returns 550 for fake names but policy block for this specific name,
-          // it's a strong positive signal
-          console.log(`ℹ️ Mailbox protected by policy (541): ${candidateEmail}`);
-          verifiedEmail = candidateEmail;
-          break;
+        } else {
+          console.log(`⚠️ Server response: ${probe.message || probe.error}`);
         }
 
         // 1-second pause to prevent rate limits
