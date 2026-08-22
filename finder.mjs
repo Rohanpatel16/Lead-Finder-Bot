@@ -91,7 +91,14 @@ function pingSmtpMailbox(email, mxHost) {
   });
 }
 
-// 4. Generate B2B Email Permutations
+// 4. Catch-All Domain Detection
+async function checkCatchAll(domain, mxHost) {
+  const fakeRandomEmail = `catchall_probe_${Math.random().toString(36).substring(7)}@${domain}`;
+  const probe = await pingSmtpMailbox(fakeRandomEmail, mxHost);
+  return probe.exists === true && probe.code === 250;
+}
+
+// 5. Generate B2B Email Permutations
 function generateEmailPermutations(fullName, domain) {
   const nameParts = fullName.trim().toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/);
   const first = nameParts[0] || '';
@@ -115,7 +122,7 @@ function generateEmailPermutations(fullName, domain) {
 // 🚀 MAIN ENGINE EXECUTION
 // ============================================================================
 async function runEmailFinder() {
-  console.log('🔍 Starting Smart Lead Finder & Email Verification Engine...');
+  console.log('🔍 Starting Enterprise Lead Finder & Email Verification Engine...');
   const sheets = await getSheets();
 
   // Load Lead_Finder rows
@@ -150,7 +157,14 @@ async function runEmailFinder() {
     const location = (row[fCol['location']] || 'your city').trim();
     const status = (row[fCol['Status']] || '').trim().toUpperCase();
 
-    if (status === 'VERIFIED' || status === 'INVALID DOMAIN' || status === 'USER_NOT_FOUND' || !rawDomain || !fullName) {
+    if (
+      status === 'VERIFIED' || 
+      status === 'CATCH_ALL' || 
+      status === 'INVALID DOMAIN' || 
+      status === 'USER_NOT_FOUND' || 
+      !rawDomain || 
+      !fullName
+    ) {
       continue;
     }
 
@@ -169,35 +183,48 @@ async function runEmailFinder() {
     } else {
       const permutations = generateEmailPermutations(fullName, mxInfo.domain);
       let verifiedEmail = null;
+      let finalStatus = 'USER_NOT_FOUND';
 
-      for (const candidateEmail of permutations) {
-        console.log(`📡 Pinging SMTP for: ${candidateEmail}...`);
+      // Step 2: Check if Domain is Catch-All
+      const isCatchAll = await checkCatchAll(mxInfo.domain, mxInfo.primaryMx);
+
+      if (isCatchAll) {
+        console.log(`⚠️ Domain [${mxInfo.domain}] is Catch-All (Accepts all emails). Using primary pattern: ${permutations[0]}`);
+        verifiedEmail = permutations[0];
+        finalStatus = 'CATCH_ALL';
+      } else {
+        console.log(`🎯 Domain [${mxInfo.domain}] is Precise. Probing individual mailboxes...`);
         
-        const probe = await pingSmtpMailbox(candidateEmail, mxInfo.primaryMx);
+        for (const candidateEmail of permutations) {
+          console.log(`📡 Pinging SMTP for: ${candidateEmail}...`);
+          
+          const probe = await pingSmtpMailbox(candidateEmail, mxInfo.primaryMx);
 
-        if (probe.exists && probe.code === 250) {
-          verifiedEmail = candidateEmail;
-          console.log(`✅ Real Mailbox Confirmed (250 OK): ${candidateEmail}`);
-          break;
-        } else if (probe.isPolicy) {
-          // If server rejects other patterns with 550 but triggers policy for this specific one, it's the real user
-          console.log(`✅ Verified via Policy Filter (User Exists): ${candidateEmail}`);
-          verifiedEmail = candidateEmail;
-          break;
-        } else if (probe.code === 550) {
-          console.log(`❌ Server rejected ${candidateEmail} (550 User Not Found)`);
-        } else {
-          console.log(`⚠️ Server response: ${probe.message || probe.error}`);
+          if (probe.exists && probe.code === 250) {
+            verifiedEmail = candidateEmail;
+            finalStatus = 'VERIFIED';
+            console.log(`✅ Real Mailbox Confirmed (250 OK): ${candidateEmail}`);
+            break;
+          } else if (probe.isPolicy) {
+            console.log(`✅ Verified via Policy Filter (User Exists): ${candidateEmail}`);
+            verifiedEmail = candidateEmail;
+            finalStatus = 'VERIFIED';
+            break;
+          } else if (probe.code === 550) {
+            console.log(`❌ Server rejected ${candidateEmail} (550 User Not Found)`);
+          } else {
+            console.log(`⚠️ Server response: ${probe.message || probe.error}`);
+          }
+
+          // 1-second pause to prevent rate limits
+          await new Promise(r => setTimeout(r, 1000));
         }
-
-        // 1-second pause to prevent rate limits
-        await new Promise(r => setTimeout(r, 1000));
       }
 
       if (verifiedEmail) {
-        row[fCol['Status']] = 'VERIFIED';
+        row[fCol['Status']] = finalStatus;
         row[fCol['Found Email']] = verifiedEmail;
-        row[fCol['Mail Provider']] = mxInfo.provider;
+        row[fCol['Mail Provider']] = `${mxInfo.provider} (${finalStatus === 'CATCH_ALL' ? 'Catch-All' : 'Precise'})`;
         row[fCol['Processed Time']] = nowTime;
         foundCount++;
 
@@ -241,7 +268,7 @@ async function runEmailFinder() {
     console.log(`🚀 Transferred ${newDetailsRows.length} verified leads to "Details" tab.`);
   }
 
-  console.log(`\n🏁 Done. Verified: ${foundCount}, Rejected/Invalid: ${invalidCount}`);
+  console.log(`\n🏁 Done. Verified/Catch-All: ${foundCount}, Rejected/Invalid: ${invalidCount}`);
 }
 
 runEmailFinder().catch(console.error);
