@@ -4,9 +4,9 @@ import dns from 'node:dns/promises';
 import net from 'node:net';
 
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
-const CONCURRENCY_LIMIT = 10;
+const CONCURRENCY_LIMIT = 5;
 
-// In-memory cache to make repeated domains instant (0ms)
+// In-memory domain cache
 const domainCache = new Map();
 
 // 1. Google Sheets Authentication
@@ -19,7 +19,7 @@ async function getSheets() {
   return google.sheets({ version: 'v4', auth });
 }
 
-// 2. Real-time DNS MX Lookup (With Domain Caching)
+// 2. Real-time DNS MX Lookup (Extracts all MX hosts)
 async function getDomainMxInfo(domain) {
   const cleanDomain = domain.replace(/^https?:\/\//i, '').replace(/^www\./i, '').split('/')[0].trim().toLowerCase();
 
@@ -36,21 +36,24 @@ async function getDomainMxInfo(domain) {
     }
 
     mxRecords.sort((a, b) => a.priority - b.priority);
+    const mxList = mxRecords.map(r => r.exchange).filter(Boolean);
 
-    const mxHosts = mxRecords.map(r => (r.exchange || '').toLowerCase()).join(' ');
+    const mxHosts = mxList.join(' ').toLowerCase();
     let provider = 'Custom Server';
     if (mxHosts.includes('google') || mxHosts.includes('aspmx')) provider = 'Google Workspace';
     else if (mxHosts.includes('outlook') || mxHosts.includes('microsoft')) provider = 'Microsoft 365';
     else if (mxHosts.includes('zoho')) provider = 'Zoho Mail';
 
-    const primaryMx = mxRecords[0]?.exchange || null;
-    if (!primaryMx) {
-      const res = { valid: false, domain: cleanDomain, provider: 'No MX Host', isDead: true };
-      domainCache.set(cleanDomain, res);
-      return res;
-    }
-
-    const res = { valid: true, domain: cleanDomain, provider, primaryMx, isCatchAll: null, isDead: false };
+    const res = { 
+      valid: true, 
+      domain: cleanDomain, 
+      provider, 
+      primaryMx: mxList[0], 
+      mxList, 
+      isCatchAll: null, 
+      isFirewalled: false,
+      isDead: false 
+    };
     domainCache.set(cleanDomain, res);
     return res;
   } catch (e) {
@@ -60,10 +63,10 @@ async function getDomainMxInfo(domain) {
   }
 }
 
-// 3. Fast RFC-Compliant SMTP Mailbox Probe
+// 3. SMTP Probe with Null Sender & Fallback Handling
 function pingSmtpMailbox(email, mxHost, timeoutMs = 2500) {
   return new Promise((resolve) => {
-    if (!mxHost) return resolve({ exists: false, isPolicy: false, error: 'NO_MX_HOST', message: 'No MX host' });
+    if (!mxHost) return resolve({ exists: false, isPolicy: false, isFirewalled: false, error: 'NO_MX' });
 
     let isResolved = false;
     let socket;
@@ -99,58 +102,67 @@ function pingSmtpMailbox(email, mxHost, timeoutMs = 2500) {
           const code = parseInt(response.slice(0, 3), 10) || 500;
           let exists = false;
           let isPolicy = false;
+          let isFirewalled = false;
 
           if (response.startsWith('250')) {
             exists = true;
           } else if (response.startsWith('541') || response.startsWith('451')) {
             isPolicy = true;
+          } else if (response.startsWith('554') || response.startsWith('421')) {
+            isFirewalled = true;
           } else {
             exists = false;
           }
 
           try { socket.write('QUIT\r\n'); } catch (e) {}
-          safeResolve({ exists, isPolicy, code, message: response.trim() });
+          safeResolve({ exists, isPolicy, isFirewalled, code, message: response.trim() });
         }
       });
 
-      socket.on('error', (err) => safeResolve({ exists: false, isPolicy: false, code: null, error: err.code || 'SOCKET_ERROR', message: err.message }));
-      socket.on('timeout', () => safeResolve({ exists: false, isPolicy: false, code: 408, error: 'TIMEOUT', message: 'Connection timed out' }));
-      socket.on('close', () => safeResolve({ exists: false, isPolicy: false, code: null, error: 'SOCKET_CLOSED', message: 'Socket connection closed' }));
+      socket.on('error', (err) => safeResolve({ exists: false, isPolicy: false, isFirewalled: true, error: err.code || 'SOCKET_ERROR', message: err.message }));
+      socket.on('timeout', () => safeResolve({ exists: false, isPolicy: false, isFirewalled: true, error: 'TIMEOUT', message: 'Connection timed out' }));
+      socket.on('close', () => safeResolve({ exists: false, isPolicy: false, isFirewalled: true, error: 'SOCKET_CLOSED', message: 'Socket connection closed' }));
     } catch (err) {
-      safeResolve({ exists: false, isPolicy: false, code: 500, error: err.message, message: err.message });
+      safeResolve({ exists: false, isPolicy: false, isFirewalled: true, error: err.message, message: err.message });
     }
   });
 }
 
-// 4. Fast-Fail Pre-Flight & Catch-All Detection
-async function checkDomainHealth(mxInfo) {
-  if (mxInfo.isDead) return { isReachable: false, isCatchAll: false };
-  if (mxInfo.isCatchAll !== null) return { isReachable: true, isCatchAll: mxInfo.isCatchAll };
+// 4. Catch-All & Firewall Pre-Flight Check
+async function checkDomainStatus(mxInfo) {
+  if (mxInfo.isDead) return { isFirewalled: true, isCatchAll: false };
+  if (mxInfo.isCatchAll !== null) return { isFirewalled: mxInfo.isFirewalled, isCatchAll: mxInfo.isCatchAll };
 
   try {
-    // ⚡ Fast 1.5s probe to check if server is alive
     const fakeEmail = `chk_${Math.random().toString(36).substring(7)}@${mxInfo.domain}`;
-    const probe = await pingSmtpMailbox(fakeEmail, mxInfo.primaryMx, 2000);
+    
+    // Probe primary MX
+    let probe = await pingSmtpMailbox(fakeEmail, mxInfo.primaryMx, 2000);
+    
+    // Fallback to secondary MX if primary is firewalled
+    if (probe.isFirewalled && mxInfo.mxList.length > 1) {
+      probe = await pingSmtpMailbox(fakeEmail, mxInfo.mxList[1], 2000);
+    }
 
-    // If server times out on the test address, the entire domain is firewalled/dead
-    if (probe.error === 'TIMEOUT') {
-      mxInfo.isDead = true;
+    if (probe.isFirewalled) {
+      mxInfo.isFirewalled = true;
       mxInfo.isCatchAll = false;
       domainCache.set(mxInfo.domain, mxInfo);
-      return { isReachable: false, isCatchAll: false };
+      return { isFirewalled: true, isCatchAll: false };
     }
 
     const isCatchAll = (probe.exists === true && probe.code === 250);
     mxInfo.isCatchAll = isCatchAll;
+    mxInfo.isFirewalled = false;
     domainCache.set(mxInfo.domain, mxInfo);
-    return { isReachable: true, isCatchAll };
+    return { isFirewalled: false, isCatchAll };
   } catch (e) {
-    mxInfo.isDead = true;
-    return { isReachable: false, isCatchAll: false };
+    mxInfo.isFirewalled = true;
+    return { isFirewalled: true, isCatchAll: false };
   }
 }
 
-// 5. Complete 15-Permutation Generator
+// 5. 15-Permutation Generator
 function generateAll15Permutations(fullName, domain) {
   const nameParts = fullName.trim().toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/);
   const first = nameParts[0] || '';
@@ -162,7 +174,7 @@ function generateAll15Permutations(fullName, domain) {
   const f = first[0];
   const l = last[0];
 
-  const permutations = [
+  return [
     `${first}.${last}@${domain}`,
     `${first}@${domain}`,
     `${f}${last}@${domain}`,
@@ -179,12 +191,10 @@ function generateAll15Permutations(fullName, domain) {
     `${last}.${f}@${domain}`,
     `${f}${l}@${domain}`
   ];
-
-  return [...new Set(permutations)];
 }
 
 // ============================================================================
-// 🚀 CONCURRENT LEAD PROCESSOR (WITH DOMAIN FAST-FAIL)
+// 🚀 CONCURRENT LEAD PROCESSOR
 // ============================================================================
 async function processSingleLead(leadItem) {
   const { fullName, companyName, rawDomain, location } = leadItem;
@@ -204,24 +214,12 @@ async function processSingleLead(leadItem) {
     }
 
     const permutations = generateAll15Permutations(fullName, mxInfo.domain);
-    
-    // ⚡ Fast-Fail Check: Test if domain is reachable in 1.5s
-    const { isReachable, isCatchAll } = await checkDomainHealth(mxInfo);
+    const { isFirewalled, isCatchAll } = await checkDomainStatus(mxInfo);
 
-    if (!isReachable) {
-      console.log(`⚡ [FAST-FAIL]: Server for "${mxInfo.domain}" is firewalled / timed out. Skipped in 1.5s.`);
-      return {
-        status: 'USER_NOT_FOUND',
-        foundEmail: permutations[0] || '',
-        provider: `${mxInfo.provider} (Unreachable)`,
-        nowTime,
-        leadForDetails: null,
-      };
-    }
-
+    // Case 1: Catch-All Domain
     if (isCatchAll) {
       const bestEmail = permutations[0];
-      console.log(`⚠️ [CATCH-ALL]: "${mxInfo.domain}" -> Auto-assigned pattern: ${bestEmail}`);
+      console.log(`⚠️ [CATCH-ALL]: "${mxInfo.domain}" -> ${bestEmail}`);
       return {
         status: 'CATCH_ALL',
         foundEmail: bestEmail,
@@ -231,13 +229,31 @@ async function processSingleLead(leadItem) {
       };
     }
 
-    // Precise Server: Probe permutations
+    // Case 2: Firewalled Domain (Valid MX, but socket probing blocked)
+    if (isFirewalled) {
+      const bestEmail = permutations[0]; // Default to standard first.last@
+      console.log(`🛡️ [MX ACTIVE - FIREWALLED]: "${mxInfo.domain}" (${mxInfo.provider}) -> Queued pattern: ${bestEmail}`);
+      return {
+        status: 'MX_ACTIVE',
+        foundEmail: bestEmail,
+        provider: `${mxInfo.provider} (Firewalled / Active MX)`,
+        nowTime,
+        leadForDetails: [fullName, bestEmail, companyName, location, '', '', '', '', '', '', 0, ''],
+      };
+    }
+
+    // Case 3: Precise Domain (Probing Allowed)
     let verifiedEmail = null;
     let finalStatus = 'USER_NOT_FOUND';
 
     for (let p = 0; p < permutations.length; p++) {
       const candidateEmail = permutations[p];
-      const probe = await pingSmtpMailbox(candidateEmail, mxInfo.primaryMx, 2500);
+      let probe = await pingSmtpMailbox(candidateEmail, mxInfo.primaryMx, 2500);
+
+      // Fallback to secondary MX if primary probe fails with policy/firewall block
+      if ((probe.isFirewalled || probe.isPolicy) && mxInfo.mxList.length > 1) {
+        probe = await pingSmtpMailbox(candidateEmail, mxInfo.mxList[1], 2500);
+      }
 
       if (probe.exists && probe.code === 250) {
         console.log(`  ✅ Pattern #${p + 1} (${candidateEmail}) [250 OK] -> "${fullName}"`);
@@ -250,11 +266,9 @@ async function processSingleLead(leadItem) {
         finalStatus = 'VERIFIED';
         break;
       } else if (probe.code === 550) {
-        // Fast skip
         continue;
-      } else if (probe.error === 'TIMEOUT') {
-        // If candidate times out, break early for this person
-        break;
+      } else if (probe.isFirewalled) {
+        break; // If firewalled mid-check, break out
       }
     }
 
@@ -294,10 +308,9 @@ async function processSingleLead(leadItem) {
 // ============================================================================
 async function runEmailFinder() {
   const startTime = Date.now();
-  console.log('⚡ Starting High-Speed 15-Pattern Lead Finder (With Fast-Fail Technology)...');
+  console.log('⚡ Starting Lead Finder with Firewall Bypass & Secondary MX Fallback...');
   const sheets = await getSheets();
 
-  // Load Lead_Finder rows
   const finderRes = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: "'🎯 Lead_Finder'!A:Z",
@@ -309,7 +322,6 @@ async function runEmailFinder() {
   }
   const fCol = Object.fromEntries(fHeaders.map((h, i) => [h.trim(), i]));
 
-  // Load Details rows
   const detailsRes = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: "'Details'!A:Z",
@@ -329,6 +341,7 @@ async function runEmailFinder() {
     if (
       status === 'VERIFIED' ||
       status === 'CATCH_ALL' ||
+      status === 'MX_ACTIVE' ||
       status === 'INVALID DOMAIN' ||
       status === 'USER_NOT_FOUND' ||
       !rawDomain ||
@@ -367,7 +380,7 @@ async function runEmailFinder() {
       fRows[lead.rowIndex][fCol['Mail Provider']] = res.provider;
       fRows[lead.rowIndex][fCol['Processed Time']] = res.nowTime;
 
-      if (res.status === 'VERIFIED' || res.status === 'CATCH_ALL') {
+      if (res.status === 'VERIFIED' || res.status === 'CATCH_ALL' || res.status === 'MX_ACTIVE') {
         foundCount++;
         if (res.leadForDetails && !existingEmails.has(res.foundEmail.toLowerCase())) {
           existingEmails.add(res.foundEmail.toLowerCase());
@@ -378,7 +391,6 @@ async function runEmailFinder() {
       }
     }
 
-    // Write chunk updates to sheet
     const firstRowNum = chunk[0].rowNum;
     const lastRowNum = chunk[chunk.length - 1].rowNum;
     const updatedChunkValues = chunk.map(c => fRows[c.rowIndex]);
@@ -398,11 +410,11 @@ async function runEmailFinder() {
       valueInputOption: 'USER_ENTERED',
       requestBody: { values: newDetailsRows },
     });
-    console.log(`\n🚀 Appended ${newDetailsRows.length} verified leads to "Details" tab.`);
+    console.log(`\n🚀 Appended ${newDetailsRows.length} leads to "Details" tab.`);
   }
 
   const durationSec = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`\n🏁 Completed in ${durationSec}s! Total Verified/Catch-All: ${foundCount}, Rejected/Invalid: ${invalidCount}`);
+  console.log(`\n🏁 Completed in ${durationSec}s! Total Valid/Queued: ${foundCount}, Rejected/Invalid: ${invalidCount}`);
 }
 
 runEmailFinder().catch(console.error);
