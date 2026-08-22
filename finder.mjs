@@ -24,78 +24,98 @@ async function getDomainMxInfo(domain) {
 
     mxRecords.sort((a, b) => a.priority - b.priority);
 
-    const mxHosts = mxRecords.map(r => r.exchange.toLowerCase()).join(' ');
+    const mxHosts = mxRecords.map(r => (r.exchange || '').toLowerCase()).join(' ');
     let provider = 'Custom Server';
     if (mxHosts.includes('google') || mxHosts.includes('aspmx')) provider = 'Google Workspace';
     else if (mxHosts.includes('outlook') || mxHosts.includes('microsoft')) provider = 'Microsoft 365';
     else if (mxHosts.includes('zoho')) provider = 'Zoho Mail';
 
-    return { valid: true, domain: cleanDomain, provider, primaryMx: mxRecords[0].exchange };
+    const primaryMx = mxRecords[0]?.exchange || null;
+    if (!primaryMx) return { valid: false, domain: cleanDomain, provider: 'No MX Host' };
+
+    return { valid: true, domain: cleanDomain, provider, primaryMx };
   } catch (e) {
     return { valid: false, domain: cleanDomain, provider: 'Dead Domain' };
   }
 }
 
-// 3. RFC-Compliant SMTP Mailbox Probe (Uses Null Sender Envelope)
+// 3. Robust RFC-Compliant SMTP Mailbox Probe
 function pingSmtpMailbox(email, mxHost) {
   return new Promise((resolve) => {
-    const domain = email.split('@')[1];
-    const socket = net.createConnection(25, mxHost);
-    let step = 0;
+    if (!mxHost) return resolve({ exists: false, isPolicy: false, error: 'NO_MX_HOST' });
 
-    socket.setTimeout(8000); // 8s timeout
-
-    socket.on('data', (data) => {
-      const response = data.toString();
-
-      // Step 1: Server greeting
-      if (step === 0 && response.startsWith('220')) {
-        socket.write(`HELO ${domain}\r\n`);
-        step++;
+    let isResolved = false;
+    const safeResolve = (val) => {
+      if (!isResolved) {
+        isResolved = true;
+        try { socket.destroy(); } catch (e) {}
+        resolve(val);
       }
-      // Step 2: RFC Null Sender (Bypasses SPF & 541 Firewall filters)
-      else if (step === 1 && response.startsWith('250')) {
-        socket.write('MAIL FROM:<>\r\n');
-        step++;
-      }
-      // Step 3: Test recipient address
-      else if (step === 2 && response.startsWith('250')) {
-        socket.write(`RCPT TO:<${email}>\r\n`);
-        step++;
-      }
-      // Step 4: Evaluate recipient response
-      else if (step === 3) {
-        const code = parseInt(response.slice(0, 3), 10) || 500;
-        let exists = false;
-        let isPolicy = false;
+    };
 
-        if (response.startsWith('250')) {
-          exists = true; // Clean confirmation
-        } else if (response.startsWith('541') || response.startsWith('451')) {
-          isPolicy = true; // Exists, but policy blocked
-        } else {
-          exists = false; // 550 User Not Found
+    let socket;
+    try {
+      const domain = email.split('@')[1];
+      socket = net.createConnection(25, mxHost);
+      let step = 0;
+
+      socket.setTimeout(6000); // 6s timeout
+
+      socket.on('data', (data) => {
+        const response = data.toString();
+
+        // Step 1: Server greeting
+        if (step === 0 && response.startsWith('220')) {
+          socket.write(`HELO ${domain}\r\n`);
+          step++;
         }
+        // Step 2: RFC Null Sender
+        else if (step === 1 && response.startsWith('250')) {
+          socket.write('MAIL FROM:<>\r\n');
+          step++;
+        }
+        // Step 3: Test recipient address
+        else if (step === 2 && response.startsWith('250')) {
+          socket.write(`RCPT TO:<${email}>\r\n`);
+          step++;
+        }
+        // Step 4: Evaluate recipient response
+        else if (step === 3) {
+          const code = parseInt(response.slice(0, 3), 10) || 500;
+          let exists = false;
+          let isPolicy = false;
 
-        socket.write('QUIT\r\n');
-        socket.end();
-        resolve({ exists, isPolicy, code, message: response.trim() });
-      }
-    });
+          if (response.startsWith('250')) {
+            exists = true;
+          } else if (response.startsWith('541') || response.startsWith('451')) {
+            isPolicy = true;
+          } else {
+            exists = false;
+          }
 
-    socket.on('error', (err) => resolve({ exists: false, isPolicy: false, error: err.code || 'SOCKET_ERROR' }));
-    socket.on('timeout', () => {
-      socket.destroy();
-      resolve({ exists: false, isPolicy: false, error: 'TIMEOUT' });
-    });
+          try { socket.write('QUIT\r\n'); } catch (e) {}
+          safeResolve({ exists, isPolicy, code, message: response.trim() });
+        }
+      });
+
+      socket.on('error', (err) => safeResolve({ exists: false, isPolicy: false, error: err.code || 'SOCKET_ERROR' }));
+      socket.on('timeout', () => safeResolve({ exists: false, isPolicy: false, error: 'TIMEOUT' }));
+      socket.on('close', () => safeResolve({ exists: false, isPolicy: false, error: 'SOCKET_CLOSED' }));
+    } catch (err) {
+      safeResolve({ exists: false, isPolicy: false, error: err.message });
+    }
   });
 }
 
 // 4. Catch-All Domain Detection
 async function checkCatchAll(domain, mxHost) {
-  const fakeRandomEmail = `catchall_probe_${Math.random().toString(36).substring(7)}@${domain}`;
-  const probe = await pingSmtpMailbox(fakeRandomEmail, mxHost);
-  return probe.exists === true && probe.code === 250;
+  try {
+    const fakeRandomEmail = `catchall_probe_${Math.random().toString(36).substring(7)}@${domain}`;
+    const probe = await pingSmtpMailbox(fakeRandomEmail, mxHost);
+    return probe.exists === true && probe.code === 250;
+  } catch (e) {
+    return false;
+  }
 }
 
 // 5. Generate B2B Email Permutations
@@ -108,9 +128,9 @@ function generateEmailPermutations(fullName, domain) {
 
   const permutations = [];
   if (first && last) {
-    permutations.push(`${first}.${last}@${domain}`); // e.g. dax.bamania@
-    permutations.push(`${first}@${domain}`);        // e.g. dax@
-    permutations.push(`${first[0]}${last}@${domain}`); // e.g. dbamania@
+    permutations.push(`${first}.${last}@${domain}`); // e.g. lakshmikanth.r@
+    permutations.push(`${first}@${domain}`);        // e.g. lakshmikanth@
+    permutations.push(`${first[0]}${last}@${domain}`);
   } else {
     permutations.push(`${first}@${domain}`);
   }
@@ -157,6 +177,7 @@ async function runEmailFinder() {
     const location = (row[fCol['location']] || 'your city').trim();
     const status = (row[fCol['Status']] || '').trim().toUpperCase();
 
+    // Skip already processed rows
     if (
       status === 'VERIFIED' || 
       status === 'CATCH_ALL' || 
@@ -172,100 +193,119 @@ async function runEmailFinder() {
     const rowNum = i + 2;
     const nowTime = new Date().toLocaleTimeString('en-US', { timeZone: 'Asia/Kolkata', hour12: true });
 
-    // Step 1: Check Domain MX
-    const mxInfo = await getDomainMxInfo(rawDomain);
-    if (!mxInfo.valid) {
-      console.log(`❌ Domain ${rawDomain} is dead / has no MX records.`);
-      row[fCol['Status']] = 'INVALID DOMAIN';
-      row[fCol['Mail Provider']] = mxInfo.provider;
-      row[fCol['Processed Time']] = nowTime;
-      invalidCount++;
-    } else {
-      const permutations = generateEmailPermutations(fullName, mxInfo.domain);
-      let verifiedEmail = null;
-      let finalStatus = 'USER_NOT_FOUND';
-
-      // Step 2: Check if Domain is Catch-All
-      const isCatchAll = await checkCatchAll(mxInfo.domain, mxInfo.primaryMx);
-
-      if (isCatchAll) {
-        console.log(`⚠️ Domain [${mxInfo.domain}] is Catch-All (Accepts all emails). Using primary pattern: ${permutations[0]}`);
-        verifiedEmail = permutations[0];
-        finalStatus = 'CATCH_ALL';
-      } else {
-        console.log(`🎯 Domain [${mxInfo.domain}] is Precise. Probing individual mailboxes...`);
-        
-        for (const candidateEmail of permutations) {
-          console.log(`📡 Pinging SMTP for: ${candidateEmail}...`);
-          
-          const probe = await pingSmtpMailbox(candidateEmail, mxInfo.primaryMx);
-
-          if (probe.exists && probe.code === 250) {
-            verifiedEmail = candidateEmail;
-            finalStatus = 'VERIFIED';
-            console.log(`✅ Real Mailbox Confirmed (250 OK): ${candidateEmail}`);
-            break;
-          } else if (probe.isPolicy) {
-            console.log(`✅ Verified via Policy Filter (User Exists): ${candidateEmail}`);
-            verifiedEmail = candidateEmail;
-            finalStatus = 'VERIFIED';
-            break;
-          } else if (probe.code === 550) {
-            console.log(`❌ Server rejected ${candidateEmail} (550 User Not Found)`);
-          } else {
-            console.log(`⚠️ Server response: ${probe.message || probe.error}`);
-          }
-
-          // 1-second pause to prevent rate limits
-          await new Promise(r => setTimeout(r, 1000));
-        }
-      }
-
-      if (verifiedEmail) {
-        row[fCol['Status']] = finalStatus;
-        row[fCol['Found Email']] = verifiedEmail;
-        row[fCol['Mail Provider']] = `${mxInfo.provider} (${finalStatus === 'CATCH_ALL' ? 'Catch-All' : 'Precise'})`;
-        row[fCol['Processed Time']] = nowTime;
-        foundCount++;
-
-        if (!existingEmails.has(verifiedEmail.toLowerCase())) {
-          existingEmails.add(verifiedEmail.toLowerCase());
-          newDetailsRows.push([
-            fullName,
-            verifiedEmail,
-            companyName,
-            location,
-            '', '', '', '', '', '', 0, ''
-          ]);
-        }
-      } else {
-        console.log(`🚫 Could not verify a valid mailbox for ${fullName} at ${rawDomain}`);
-        row[fCol['Status']] = 'USER_NOT_FOUND';
-        row[fCol['Found Email']] = permutations[0] || '';
+    try {
+      // Step 1: Check Domain MX
+      const mxInfo = await getDomainMxInfo(rawDomain);
+      if (!mxInfo.valid) {
+        console.log(`❌ Domain ${rawDomain} is dead / has no MX records.`);
+        row[fCol['Status']] = 'INVALID DOMAIN';
         row[fCol['Mail Provider']] = mxInfo.provider;
         row[fCol['Processed Time']] = nowTime;
         invalidCount++;
-      }
-    }
+      } else {
+        const permutations = generateEmailPermutations(fullName, mxInfo.domain);
+        let verifiedEmail = null;
+        let finalStatus = 'USER_NOT_FOUND';
 
-    // Update Sheet
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `'🎯 Lead_Finder'!A${rowNum}:Z${rowNum}`,
-      valueInputOption: 'USER_ENTERED',
-      requestBody: { values: [row] },
-    });
+        // Step 2: Check Catch-All
+        const isCatchAll = await checkCatchAll(mxInfo.domain, mxInfo.primaryMx);
+
+        if (isCatchAll) {
+          console.log(`⚠️ Domain [${mxInfo.domain}] is Catch-All. Using pattern: ${permutations[0]}`);
+          verifiedEmail = permutations[0];
+          finalStatus = 'CATCH_ALL';
+        } else {
+          console.log(`🎯 Domain [${mxInfo.domain}] is Precise. Probing mailboxes...`);
+          
+          for (const candidateEmail of permutations) {
+            console.log(`📡 Pinging SMTP for: ${candidateEmail}...`);
+            
+            const probe = await pingSmtpMailbox(candidateEmail, mxInfo.primaryMx);
+
+            if (probe.exists && probe.code === 250) {
+              verifiedEmail = candidateEmail;
+              finalStatus = 'VERIFIED';
+              console.log(`✅ Real Mailbox Confirmed (250 OK): ${candidateEmail}`);
+              break;
+            } else if (probe.isPolicy) {
+              console.log(`✅ Verified via Policy Filter (User Exists): ${candidateEmail}`);
+              verifiedEmail = candidateEmail;
+              finalStatus = 'VERIFIED';
+              break;
+            } else if (probe.code === 550) {
+              console.log(`❌ Server rejected ${candidateEmail} (550 User Not Found)`);
+            } else {
+              console.log(`⚠️ Server response: ${probe.message || probe.error}`);
+            }
+
+            await new Promise(r => setTimeout(r, 600));
+          }
+        }
+
+        if (verifiedEmail) {
+          row[fCol['Status']] = finalStatus;
+          row[fCol['Found Email']] = verifiedEmail;
+          row[fCol['Mail Provider']] = `${mxInfo.provider} (${finalStatus === 'CATCH_ALL' ? 'Catch-All' : 'Precise'})`;
+          row[fCol['Processed Time']] = nowTime;
+          foundCount++;
+
+          if (!existingEmails.has(verifiedEmail.toLowerCase())) {
+            existingEmails.add(verifiedEmail.toLowerCase());
+            newDetailsRows.push([
+              fullName,
+              verifiedEmail,
+              companyName,
+              location,
+              '', '', '', '', '', '', 0, ''
+            ]);
+          }
+        } else {
+          console.log(`🚫 Could not verify a valid mailbox for ${fullName} at ${rawDomain}`);
+          row[fCol['Status']] = 'USER_NOT_FOUND';
+          row[fCol['Found Email']] = permutations[0] || '';
+          row[fCol['Mail Provider']] = mxInfo.provider;
+          row[fCol['Processed Time']] = nowTime;
+          invalidCount++;
+        }
+      }
+
+      // Update row in Sheet
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SPREADSHEET_ID,
+        range: `'🎯 Lead_Finder'!A${rowNum}:Z${rowNum}`,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: [row] },
+      });
+
+    } catch (err) {
+      console.error(`⚠️ Error processing row ${rowNum} (${fullName}):`, err.message);
+      row[fCol['Status']] = 'ERROR';
+      row[fCol['Processed Time']] = nowTime;
+
+      try {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: SPREADSHEET_ID,
+          range: `'🎯 Lead_Finder'!A${rowNum}:Z${rowNum}`,
+          valueInputOption: 'USER_ENTERED',
+          requestBody: { values: [row] },
+        });
+      } catch (e) {}
+    }
   }
 
   // Transfer verified leads to Details
   if (newDetailsRows.length > 0) {
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range: "'Details'!A:L",
-      valueInputOption: 'USER_ENTERED',
-      requestBody: { values: newDetailsRows },
-    });
-    console.log(`🚀 Transferred ${newDetailsRows.length} verified leads to "Details" tab.`);
+    try {
+      await sheets.spreadsheets.values.append({
+        spreadsheetId: SPREADSHEET_ID,
+        range: "'Details'!A:L",
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: newDetailsRows },
+      });
+      console.log(`🚀 Transferred ${newDetailsRows.length} verified leads to "Details" tab.`);
+    } catch (e) {
+      console.error('Error appending to Details sheet:', e.message);
+    }
   }
 
   console.log(`\n🏁 Done. Verified/Catch-All: ${foundCount}, Rejected/Invalid: ${invalidCount}`);
